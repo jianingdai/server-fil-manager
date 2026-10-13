@@ -141,3 +141,37 @@ func TestManagedRootCannotBeReplacedBySymlink(t *testing.T) {
 		t.Fatalf("replaced root error = %v", err)
 	}
 }
+
+func TestBrowseDirectoriesListsOnlyRealDirectories(t *testing.T) {
+	base := t.TempDir()
+	selected := filepath.Join(base, "selected")
+	child := filepath.Join(selected, "child")
+	if err := os.MkdirAll(child, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(selected, "file.txt"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(selected, "linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	manager, err := New(filepath.Join(base, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	listing, err := manager.BrowseDirectories(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listing.Path != selected || listing.Parent != base || len(listing.Directories) != 1 || listing.Directories[0].Name != "child" {
+		t.Fatalf("directory listing = %#v", listing)
+	}
+	if _, err := manager.BrowseDirectories(selected + "/../selected"); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("traversal path error = %v", err)
+	}
+	if _, err := manager.BrowseDirectories(filepath.Join(selected, "linked")); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("symlink path error = %v", err)
+	}
+}

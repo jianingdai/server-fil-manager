@@ -1,5 +1,5 @@
 const $ = (selector, scope = document) => scope.querySelector(selector);
-const state = { user: null, csrf: "", roots: [], grants: new Map(), root: null, path: "", entries: [], page: "files", toastTimer: 0 };
+const state = { user: null, csrf: "", roots: [], grants: new Map(), root: null, path: "", entries: [], page: "files", toastTimer: 0, browserPath: "/" };
 
 function toast(message, bad = false) {
   const node = $("#toast");
@@ -21,6 +21,72 @@ async function api(url, options = {}) {
   const payload = type.includes("application/json") ? await response.json() : null;
   if (!response.ok) throw new Error(payload?.error || `请求失败 (${response.status})`);
   return payload;
+}
+
+function transferRow(name, direction) {
+  const list = $("#transfer-list");
+  list.hidden = false;
+  const row = document.createElement("div"); row.className = "transfer-item";
+  const label = document.createElement("span"); label.className = "transfer-name"; label.textContent = `${direction} ${name}`;
+  const progress = document.createElement("progress"); progress.max = 100; progress.value = 0; progress.setAttribute("aria-label", `${name}传输进度`);
+  const status = document.createElement("span"); status.className = "transfer-status"; status.textContent = "准备中";
+  row.append(label, progress, status); list.append(row);
+  while (list.children.length > 10) list.firstElementChild.remove();
+  const update = (loaded, total, stateText = "传输中") => {
+    if (Number.isFinite(total) && total > 0) {
+      const percent = Math.min(100, Math.round(loaded * 100 / total));
+      progress.value = percent;
+      status.textContent = `${formatSize(loaded)} / ${formatSize(total)} · ${percent}% · ${stateText}`;
+    } else {
+      progress.removeAttribute("value");
+      status.textContent = `${formatSize(loaded)} · 总量未知 · ${stateText}`;
+    }
+    status.classList.toggle("done", stateText === "已完成");
+    status.classList.toggle("failed", stateText.startsWith("失败"));
+  };
+  return { update, done(bytes) { if (bytes === 0) { progress.value = 100; status.textContent = "0 B / 0 B · 100% · 已完成"; status.classList.add("done"); return; } update(bytes, bytes, "已完成"); }, fail(message) { status.textContent = `失败：${message}`; status.classList.add("failed"); } };
+}
+
+function requestWithProgress(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const method = (options.method || "GET").toUpperCase();
+    xhr.open(method, url, true);
+    xhr.withCredentials = true;
+    if (options.download) xhr.responseType = "blob";
+    xhr.setRequestHeader("Accept", options.download ? "application/octet-stream" : "application/json");
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
+    if (options.uploadProgress) xhr.upload.addEventListener("progress", event => options.uploadProgress(event.loaded, event.lengthComputable ? event.total : 0));
+    if (options.downloadProgress) xhr.addEventListener("progress", event => options.downloadProgress(event.loaded, event.lengthComputable ? event.total : 0));
+    xhr.addEventListener("error", () => reject(new Error("网络连接失败")));
+    xhr.addEventListener("abort", () => reject(new Error("传输已取消")));
+    xhr.addEventListener("load", async () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let message = `请求失败 (${xhr.status})`;
+        try {
+          const body = options.download ? await xhr.response.text() : xhr.responseText;
+          const payload = JSON.parse(body); message = payload.error || message;
+        } catch {}
+        reject(new Error(message)); return;
+      }
+      resolve(options.download ? { blob: xhr.response, disposition: xhr.getResponseHeader("Content-Disposition") || "" } : null);
+    });
+    xhr.send(options.body || null);
+  });
+}
+
+function saveDownloadedBlob(result, url, fallbackName) {
+  let filename = fallbackName;
+  const responseURL = new URL(url, window.location.href);
+  const path = responseURL.searchParams.get("path") || "";
+  if (path) filename = path.split("/").pop() || filename;
+  const encoded = result.disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  const plain = result.disposition.match(/filename="?([^";]+)"?/i);
+  try { if (encoded) filename = decodeURIComponent(encoded[1]); else if (plain) filename = plain[1]; } catch {}
+  const objectURL = URL.createObjectURL(result.blob);
+  const link = document.createElement("a"); link.href = objectURL; link.download = filename; link.hidden = true;
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectURL), 60000);
 }
 
 function showLoggedOut() {
@@ -161,11 +227,41 @@ function actionButton(label, action, entry, className) { const b = document.crea
 function formatSize(size) { if (!Number.isFinite(size)) return "—"; const units = ["B","KB","MB","GB","TB"]; let n = size, i = 0; while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; } return `${i ? n.toFixed(1) : n} ${units[i]}`; }
 function formatDate(value) { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.valueOf()) ? "—" : new Intl.DateTimeFormat("zh-CN", { dateStyle:"medium", timeStyle:"short" }).format(date); }
 
+async function browseServerDirectory(path = "/") {
+  const dialog = $("#directory-picker");
+  $("#picker-error").textContent = "";
+  $("#picker-directories").replaceChildren();
+  $("#picker-path").textContent = path;
+  state.browserPath = path;
+  $("#picker-parent").disabled = path === "/";
+  if (!dialog.open) dialog.showModal();
+  try {
+    const listing = await api(`/api/admin/fs?path=${encodePath(path)}`);
+    state.browserPath = listing.path;
+    $("#picker-path").textContent = listing.path;
+    $("#picker-parent").disabled = !listing.parent;
+    const container = $("#picker-directories");
+    for (const directory of listing.directories || []) {
+      const button = document.createElement("button"); button.type = "button"; button.className = "picker-dir"; button.textContent = `📁 ${directory.name}`;
+      button.addEventListener("click", () => browseServerDirectory(directory.path)); container.append(button);
+    }
+    if (!container.children.length) { const empty = document.createElement("p"); empty.className = "picker-empty"; empty.textContent = "当前目录下没有可访问的子目录。"; container.append(empty); }
+  } catch (error) {
+    $("#picker-error").textContent = error.message;
+  }
+}
+
 async function onFileAction(button) {
   const action = button.dataset.action;
   const path = button.dataset.path;
+  let activeTransfer = null;
   try {
-    if (action === "download") { window.location.href = `/api/files/download?rootId=${state.root.id}&path=${encodePath(path)}`; return; }
+    if (action === "download") {
+      const url = `/api/files/download?rootId=${state.root.id}&path=${encodePath(path)}`;
+      activeTransfer = transferRow(button.dataset.name, "下载");
+      const result = await requestWithProgress(url, { download:true, downloadProgress:(loaded,total)=>activeTransfer.update(loaded,total) });
+      saveDownloadedBlob(result, url, button.dataset.name); activeTransfer.done(result.blob.size); toast(`下载完成：${button.dataset.name}`); return;
+    }
     if (action === "delete") {
       if (!window.confirm(`将“${button.dataset.name}”移入回收站？`)) return;
       await api("/api/files/actions", { method:"POST", body:JSON.stringify({ action, rootId:state.root.id, path }) });
@@ -183,7 +279,7 @@ async function onFileAction(button) {
       await api("/api/files/actions", { method:"POST", body:JSON.stringify({ action, rootId:state.root.id, path, destinationRootId:targetRoot.id, destinationPath }) });
       toast(action === "copy" ? "复制完成" : "移动完成"); await loadFiles();
     }
-  } catch (error) { toast(error.message, true); }
+  } catch (error) { activeTransfer?.fail(error.message); toast(error.message, true); }
 }
 
 async function chooseRoot() {
@@ -212,6 +308,7 @@ async function makeUserCard(user) {
   const actions = document.createElement("div"); actions.className = "entity-actions";
   const badge = document.createElement("span"); badge.className = `badge ${user.active ? "" : "off"}`; badge.textContent = user.active ? "已启用" : "已停用"; actions.append(badge);
   const active = document.createElement("button"); active.className = "mini"; active.textContent = user.active ? "停用" : "启用"; active.addEventListener("click", async()=>{try{await api(`/api/admin/users/${user.id}/active`,{method:"PATCH",body:JSON.stringify({active:!user.active})});toast("账号状态已更新");await loadUsers()}catch(e){toast(e.message,true)}});actions.append(active);
+  const remove = document.createElement("button"); remove.className = "mini danger"; remove.textContent = "删除用户"; remove.addEventListener("click",async()=>{if(!window.confirm(`永久删除普通用户“${user.username}”？账号权限和会话将撤销，用户名可重新使用；其回收站内容会保留给管理员处理。`))return;try{await api(`/api/admin/users/${user.id}`,{method:"DELETE"});toast("用户已删除");await loadUsers()}catch(e){toast(e.message,true)}});actions.append(remove);
   const reset = document.createElement("button"); reset.className = "mini"; reset.textContent = "重置密码"; reset.addEventListener("click",async()=>{const password=window.prompt("输入新密码（至少 12 个字符）");if(!password)return;try{await api(`/api/admin/users/${user.id}/password`,{method:"PUT",body:JSON.stringify({password})});toast("密码已重置，旧会话已退出")}catch(e){toast(e.message,true)}});actions.append(reset);
   head.append(main,actions); card.append(head);
   const editor = document.createElement("div"); editor.className = "permission-editor";
@@ -235,7 +332,19 @@ function permissionSection(userID,grant){
 
 async function loadRootAdmin() {
   const {roots}=await api("/api/admin/roots");const list=$("#roots-list");list.replaceChildren();
-  for(const root of roots||[]){const card=document.createElement("article");card.className="entity-card";const main=document.createElement("div");main.className="entity-main";const title=document.createElement("p");title.className="entity-title";title.textContent=root.name;const sub=document.createElement("p");sub.className="entity-sub";sub.textContent=root.path;main.append(title,sub);const side=document.createElement("div");side.className="entity-actions";const badge=document.createElement("span");badge.className=`badge ${root.active?"":"off"}`;badge.textContent=root.active?"已共享":"已停用";side.append(badge);const toggle=document.createElement("button");toggle.className="mini danger";toggle.textContent=root.active?"停用目录":"重新启用";toggle.addEventListener("click",async()=>{if(root.active&&!confirm(`停用“${root.name}”？用户将无法继续访问。`))return;try{await api(`/api/admin/roots/${root.id}/active`,{method:"PATCH",body:JSON.stringify({active:!root.active})});toast(root.active?"目录已停用":"目录已重新启用");await loadRootAdmin();await loadRoots()}catch(e){toast(e.message,true)}});side.append(toggle);card.append(main,side);list.append(card)}
+  for(const root of roots||[]){
+    const card=document.createElement("article");card.className="entity-card";
+    const main=document.createElement("div");main.className="entity-main";
+    const title=document.createElement("p");title.className="entity-title";title.textContent=root.name;
+    const sub=document.createElement("p");sub.className="entity-sub";sub.textContent=root.path;main.append(title,sub);
+    const side=document.createElement("div");side.className="entity-actions";
+    const badge=document.createElement("span");badge.className=`badge ${root.active?"":"off"}`;badge.textContent=root.active?"已共享":"已停用";side.append(badge);
+    const toggle=document.createElement("button");toggle.className="mini";toggle.textContent=root.active?"停用目录":"重新启用";
+    toggle.addEventListener("click",async()=>{if(root.active&&!confirm(`停用“${root.name}”？用户将无法继续访问。`))return;try{await api(`/api/admin/roots/${root.id}/active`,{method:"PATCH",body:JSON.stringify({active:!root.active})});toast(root.active?"目录已停用":"目录已重新启用");await loadRootAdmin();await loadRoots()}catch(e){toast(e.message,true)}});
+    const remove=document.createElement("button");remove.className="mini danger";remove.textContent="删除登记";
+    remove.addEventListener("click",async()=>{if(!confirm(`删除共享目录“${root.name}”的登记和授权？服务器上的原目录和文件不会删除；如有待处理回收站内容需先恢复或清理。`))return;try{await api(`/api/admin/roots/${root.id}`,{method:"DELETE"});toast("共享目录登记已删除");await loadRootAdmin();await loadRoots()}catch(e){toast(e.message,true)}});
+    side.append(toggle,remove);card.append(main,side);list.append(card)
+  }
   if(!roots?.length)list.append(emptyMessage("还没有共享目录","添加服务器目录后，再给普通用户配置权限。"));
 }
 
@@ -257,11 +366,25 @@ $("#logout").addEventListener("click",async()=>{try{await api("/api/auth/logout"
 document.querySelectorAll(".nav-item").forEach(button=>button.addEventListener("click",()=>setPage(button.dataset.page)));
 $("#root-select").addEventListener("change",async event=>{state.root=state.roots.find(root=>String(root.id)===event.target.value)||null;state.path="";await loadFiles()});
 $("#new-folder").addEventListener("click",async()=>{if(!state.root)return;const name=prompt("文件夹名称");if(!name)return;try{await api("/api/files/actions",{method:"POST",body:JSON.stringify({action:"create_dir",rootId:state.root.id,path:state.path,name})});toast("文件夹已创建");await loadFiles()}catch(e){toast(e.message,true)}});
-$("#upload-input").addEventListener("change",async event=>{if(!state.root)return;const files=Array.from(event.target.files||[]);for(const file of files){const form=new FormData();form.set("path",state.path);form.set("file",file,file.name);try{await api(`/api/files/upload?rootId=${state.root.id}`,{method:"POST",body:form})}catch(e){toast(`${file.name}：${e.message}`,true)}}event.target.value="";await loadFiles()});
+$("#upload-input").addEventListener("change",async event=>{
+  if(!state.root)return;
+  const files=Array.from(event.target.files||[]), rootID=state.root.id, targetPath=state.path;
+  for(const file of files){
+    const form=new FormData();form.set("path",targetPath);form.set("file",file,file.name);
+    const transfer=transferRow(file.name,"上传");
+    try{await requestWithProgress(`/api/files/upload?rootId=${rootID}`,{method:"POST",body:form,uploadProgress:(loaded,total)=>transfer.update(loaded,total)});transfer.done(file.size)}
+    catch(e){transfer.fail(e.message);toast(`${file.name}：${e.message}`,true)}
+  }
+  event.target.value="";await loadFiles()
+});
 $("#file-rows").addEventListener("click",event=>{const button=event.target.closest("button[data-action]");if(button)onFileAction(button)});
 $("#search-button").addEventListener("click",async()=>{if(!state.root)return;const q=$("#search-input").value.trim();if(!q){await loadFiles();return}try{const {entries}=await api(`/api/search?rootId=${state.root.id}&path=${encodePath(state.path)}&q=${encodeURIComponent(q)}`);renderFiles(entries||[],true);$("#empty-files").hidden=(entries||[]).length>0;toast(`找到 ${(entries||[]).length} 项`)}catch(e){toast(e.message,true)}});
 $("#search-input").addEventListener("keydown",event=>{if(event.key==="Enter")$("#search-button").click()});
 $("#create-user-form").addEventListener("submit",async event=>{event.preventDefault();const formEl=event.currentTarget;const form=new FormData(formEl);try{await api("/api/admin/users",{method:"POST",body:JSON.stringify({username:form.get("username"),password:form.get("password")})});formEl.reset();toast("普通用户已创建");await loadUsers()}catch(e){toast(e.message,true)}});
 $("#create-root-form").addEventListener("submit",async event=>{event.preventDefault();const formEl=event.currentTarget;const form=new FormData(formEl);try{const name=String(form.get("name")||"");const path=String(form.get("path")||"");const preview=await api("/api/admin/roots/preview",{method:"POST",body:JSON.stringify({path})});if(!window.confirm(`服务器解析后的规范路径为：\n\n${preview.path}\n\n确认添加“${name}”吗？`))return;const result=await api("/api/admin/roots",{method:"POST",body:JSON.stringify({name,path})});formEl.reset();toast(`已添加：${result.root.path}`);await loadRootAdmin();await loadRoots()}catch(e){toast(e.message,true)}});
+
+$("#browse-root-path").addEventListener("click",()=>browseServerDirectory("/"));
+$("#picker-parent").addEventListener("click",()=>{const current=state.browserPath;const parent=current==="/"?"/":current.slice(0,current.lastIndexOf("/"))||"/";browseServerDirectory(parent)});
+$("#picker-select").addEventListener("click",()=>{$("#create-root-form [name=path]").value=state.browserPath;$("#directory-picker").close()});
 
 bootstrap();

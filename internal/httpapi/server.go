@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"server-file-manager/internal/auth"
@@ -64,13 +66,15 @@ func (a *API) Handler() http.Handler {
 	protected.HandleFunc("POST /api/trash/{id}/restore", a.restoreTrash)
 	protected.HandleFunc("GET /api/admin/users", a.adminUsers)
 	protected.HandleFunc("POST /api/admin/users", a.adminCreateUser)
+	protected.HandleFunc("DELETE /api/admin/users/{id}", a.adminDeleteUser)
 	protected.HandleFunc("PATCH /api/admin/users/{id}/active", a.adminSetActive)
 	protected.HandleFunc("PUT /api/admin/users/{id}/password", a.adminResetPassword)
 	protected.HandleFunc("GET /api/admin/users/{id}/permissions", a.adminGetPermissions)
 	protected.HandleFunc("PUT /api/admin/users/{id}/permissions", a.adminSetPermissions)
 	protected.HandleFunc("GET /api/admin/roots", a.adminRoots)
+	protected.HandleFunc("GET /api/admin/fs", a.adminBrowseFS)
 	protected.HandleFunc("POST /api/admin/roots", a.adminCreateRoot)
-	protected.HandleFunc("DELETE /api/admin/roots/{id}", a.adminDisableRoot)
+	protected.HandleFunc("DELETE /api/admin/roots/{id}", a.adminDeleteRoot)
 	protected.HandleFunc("PATCH /api/admin/roots/{id}/active", a.adminSetRootActive)
 	protected.HandleFunc("POST /api/admin/roots/preview", a.adminPreviewRoot)
 	protected.HandleFunc("DELETE /api/admin/trash/{id}", a.adminPurgeTrash)
@@ -304,6 +308,31 @@ func (a *API) adminSetActive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+func (a *API) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	target, err := a.DB.UserByID(id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if target.Role != model.RoleUser {
+		writeError(w, http.StatusBadRequest, "网页只能删除普通用户")
+		return
+	}
+	if err := a.DB.DeleteUser(id); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	a.audit(r, "user.delete", nil, target.Username, "ok")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (a *API) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
@@ -351,6 +380,22 @@ func (a *API) adminRoots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"roots": roots})
+}
+
+func (a *API) adminBrowseFS(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		path = string(os.PathSeparator)
+	}
+	listing, err := a.Files.BrowseDirectories(path)
+	if err != nil {
+		writeFileError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, listing)
 }
 
 func (a *API) adminCreateRoot(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +518,7 @@ func pathsOverlap(a, b string) bool {
 	return rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-func (a *API) adminDisableRoot(w http.ResponseWriter, r *http.Request) {
+func (a *API) adminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
@@ -481,11 +526,20 @@ func (a *API) adminDisableRoot(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := a.DB.SetRootActive(id, false); err != nil {
+	root, err := a.DB.Root(id)
+	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	a.audit(r, "root.disable", &id, "", "ok")
+	if err := a.DB.DeleteRoot(id); err != nil {
+		if errors.Is(err, store.ErrRootHasTrash) {
+			writeError(w, http.StatusConflict, "该目录仍有可恢复的回收站内容，请先恢复或永久清理")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	a.audit(r, "root.delete", nil, root.Path, "ok")
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -1010,8 +1064,29 @@ func (l *loginLimiter) Success(ip string) { l.mu.Lock(); delete(l.items, ip); l.
 
 func Run(addr, cert, key string, handler http.Handler) error {
 	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
-	if cert != "" && key != "" {
-		return srv.ListenAndServeTLS(cert, key)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result := make(chan error, 1)
+	go func() {
+		if cert != "" && key != "" {
+			result <- srv.ListenAndServeTLS(cert, key)
+			return
+		}
+		result <- srv.ListenAndServe()
+	}()
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			return err
+		}
+		return nil
 	}
-	return srv.ListenAndServe()
 }

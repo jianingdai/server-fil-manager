@@ -47,6 +47,71 @@ func New(dataDir string) (*Manager, error) {
 
 func (m *Manager) Close() error { return m.dataRoot.Close() }
 
+// BrowseDirectories lists only real directories and never follows symbolic
+// links. The requested path is an absolute server path and is only exposed by
+// the administrator-only API.
+func (m *Manager) BrowseDirectories(requested string) (model.DirectoryBrowser, error) {
+	if !filepath.IsAbs(requested) || strings.ContainsRune(requested, 0) {
+		return model.DirectoryBrowser{}, ErrInvalidPath
+	}
+	for _, part := range strings.Split(filepath.ToSlash(requested), "/") {
+		if part == ".." {
+			return model.DirectoryBrowser{}, ErrInvalidPath
+		}
+	}
+	clean := filepath.Clean(requested)
+	if clean != requested {
+		return model.DirectoryBrowser{}, ErrInvalidPath
+	}
+	if err := rejectSymlinkPath(clean); err != nil {
+		return model.DirectoryBrowser{}, err
+	}
+	info, err := os.Stat(clean)
+	if err != nil {
+		return model.DirectoryBrowser{}, err
+	}
+	if !info.IsDir() {
+		return model.DirectoryBrowser{}, ErrInvalidPath
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return model.DirectoryBrowser{}, err
+	}
+	result := model.DirectoryBrowser{Path: clean, Directories: make([]model.Directory, 0)}
+	if clean != string(os.PathSeparator) {
+		result.Parent = filepath.Dir(clean)
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		entryInfo, err := entry.Info()
+		if err != nil || !entryInfo.IsDir() || entryInfo.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		result.Directories = append(result.Directories, model.Directory{Name: entry.Name(), Path: filepath.Join(clean, entry.Name())})
+	}
+	return result, nil
+}
+
+func rejectSymlinkPath(abs string) error {
+	current := string(os.PathSeparator)
+	for _, part := range strings.Split(strings.TrimPrefix(abs, current), current) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ErrSymlink
+		}
+	}
+	return nil
+}
+
 func CleanRelative(input string, allowRoot bool) (string, error) {
 	if strings.ContainsRune(input, 0) || path.IsAbs(input) {
 		return "", ErrInvalidPath

@@ -58,3 +58,14 @@ type FileEntry struct {
 	ModTime string `json:"modTime"`
 	Mode    string `json:"mode"`
 }
+
+type DirectoryBrowser struct {
+	Path        string      `json:"path"`
+	Parent      string      `json:"parent,omitempty"`
+	Directories []Directory `json:"directories"`
+}
+
+type Directory struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}

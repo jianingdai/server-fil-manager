@@ -14,7 +14,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var ErrNotFound = errors.New("record not found")
+var (
+	ErrNotFound     = errors.New("record not found")
+	ErrRootHasTrash = errors.New("root has recoverable trash entries")
+)
 
 type Store struct{ db *sql.DB }
 
@@ -129,8 +132,56 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply database schema: %w", err)
 	}
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)`, stamp(time.Now()))
-	return err
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)`, stamp(time.Now())); err != nil {
+		return err
+	}
+	var version int
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+		return err
+	}
+	if version < 2 {
+		if err := s.migrateTrashDeletedByNullable(); err != nil {
+			return fmt.Errorf("migrate database to v2: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) migrateTrashDeletedByNullable() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	statements := []string{
+		`DROP INDEX IF EXISTS trash_user_idx`,
+		`ALTER TABLE trash_entries RENAME TO trash_entries_v1`,
+		`CREATE TABLE trash_entries (
+  id TEXT PRIMARY KEY,
+  root_id INTEGER NOT NULL REFERENCES storage_roots(id) ON DELETE RESTRICT,
+  original_path TEXT NOT NULL,
+  stored_path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('pending','ready','restoring','purging','restored','purged')),
+  restored_at TEXT,
+  purged_at TEXT
+)`,
+		`INSERT INTO trash_entries(id,root_id,original_path,stored_path,name,deleted_by,deleted_at,status,restored_at,purged_at)
+ SELECT id,root_id,original_path,stored_path,name,deleted_by,deleted_at,status,restored_at,purged_at FROM trash_entries_v1`,
+		`DROP TABLE trash_entries_v1`,
+		`CREATE INDEX trash_user_idx ON trash_entries(deleted_by, deleted_at)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)`, stamp(time.Now())); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
@@ -193,6 +244,11 @@ func (s *Store) UserByID(id int64) (model.User, error) {
 	}
 	u.Active, u.CreatedAt = active == 1, parseStamp(created)
 	return u, nil
+}
+
+func (s *Store) DeleteUser(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM users WHERE id=? AND role='user'`, id)
+	return requireChanged(res, err)
 }
 
 func (s *Store) Users() ([]model.User, error) {
@@ -378,6 +434,29 @@ func (s *Store) SetRootActive(id int64, active bool) error {
 	return requireChanged(res, err)
 }
 
+func (s *Store) DeleteRoot(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pending int
+	if err := tx.QueryRow(`SELECT count(*) FROM trash_entries WHERE root_id=? AND status IN ('pending','ready','restoring','purging')`, id).Scan(&pending); err != nil {
+		return err
+	}
+	if pending > 0 {
+		return ErrRootHasTrash
+	}
+	if _, err := tx.Exec(`DELETE FROM trash_entries WHERE root_id=? AND status IN ('restored','purged')`, id); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`DELETE FROM storage_roots WHERE id=?`, id)
+	if err = requireChanged(res, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SetPermissions(userID, rootID int64, p model.Permissions) error {
 	vals := []any{userID, rootID, boolInt(p.List), boolInt(p.Download), boolInt(p.Upload), boolInt(p.CreateDir), boolInt(p.Rename), boolInt(p.Delete), boolInt(p.Copy), boolInt(p.Move), boolInt(p.Search), stamp(time.Now())}
 	_, err := s.db.Exec(`INSERT INTO user_root_permissions(user_id,root_id,can_list,can_download,can_upload,can_create_dir,can_rename,can_delete,can_copy,can_move,can_search,updated_at)
@@ -456,7 +535,7 @@ func (s *Store) CreateTrash(e model.TrashEntry, storedPath string) error {
 func (s *Store) Trash(id string) (model.TrashEntry, string, error) {
 	var e model.TrashEntry
 	var p, deleted string
-	err := s.db.QueryRow(`SELECT t.id,t.root_id,r.name,t.original_path,t.name,t.deleted_by,t.deleted_at,t.stored_path FROM trash_entries t JOIN storage_roots r ON r.id=t.root_id WHERE t.id=? AND t.status='ready' AND t.restored_at IS NULL AND t.purged_at IS NULL`, id).Scan(&e.ID, &e.RootID, &e.RootName, &e.OriginalPath, &e.Name, &e.DeletedBy, &deleted, &p)
+	err := s.db.QueryRow(`SELECT t.id,t.root_id,r.name,t.original_path,t.name,COALESCE(t.deleted_by,0),t.deleted_at,t.stored_path FROM trash_entries t JOIN storage_roots r ON r.id=t.root_id WHERE t.id=? AND t.status='ready' AND t.restored_at IS NULL AND t.purged_at IS NULL`, id).Scan(&e.ID, &e.RootID, &e.RootName, &e.OriginalPath, &e.Name, &e.DeletedBy, &deleted, &p)
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, "", ErrNotFound
 	}
@@ -467,7 +546,7 @@ func (s *Store) Trash(id string) (model.TrashEntry, string, error) {
 	return e, p, nil
 }
 func (s *Store) TrashEntries(actor int64, admin bool) ([]model.TrashEntry, error) {
-	q := `SELECT t.id,t.root_id,r.name,t.original_path,t.name,t.deleted_by,t.deleted_at FROM trash_entries t JOIN storage_roots r ON r.id=t.root_id WHERE t.status='ready' AND t.restored_at IS NULL AND t.purged_at IS NULL`
+	q := `SELECT t.id,t.root_id,r.name,t.original_path,t.name,COALESCE(t.deleted_by,0),t.deleted_at FROM trash_entries t JOIN storage_roots r ON r.id=t.root_id WHERE t.status='ready' AND t.restored_at IS NULL AND t.purged_at IS NULL`
 	args := []any{}
 	if !admin {
 		q += ` AND t.deleted_by=? AND r.active=1 AND EXISTS (

@@ -3,12 +3,20 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"server-file-manager/internal/auth"
 	"server-file-manager/internal/filemanager"
@@ -125,6 +133,49 @@ func TestPermissionChecksAndCSRF(t *testing.T) {
 	}
 }
 
+func TestUploadAndDownloadPreserveFileContentsAndRejectOverwrite(t *testing.T) {
+	e := newTestEnv(t)
+	if err := e.db.SetPermissions(e.user.ID, e.root.ID, model.Permissions{List: true, Upload: true, Download: true}); err != nil {
+		t.Fatal(err)
+	}
+	postUpload := func(contents string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		if err := writer.WriteField("path", "."); err != nil {
+			t.Fatal(err)
+		}
+		file, err := writer.CreateFormFile("file", "payload.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte(contents)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest("POST", "/api/files/upload?rootId=1", &body)
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: e.userToken})
+		req.Header.Set("X-CSRF-Token", e.userCSRF)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		response := httptest.NewRecorder()
+		e.api.Handler().ServeHTTP(response, req)
+		return response
+	}
+	response := postUpload("exact contents")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("upload status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = postUpload("overwrite attempt")
+	if response.Code != http.StatusConflict {
+		t.Fatalf("duplicate upload status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = call(e.api.Handler(), "GET", "/api/files/download?rootId=1&path=payload.txt", e.userToken, "", nil)
+	if response.Code != http.StatusOK || response.Body.String() != "exact contents" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
 func TestRootWithNoGrantedPermissionsIsHidden(t *testing.T) {
 	e := newTestEnv(t)
 	if err := e.db.SetPermissions(e.user.ID, e.root.ID, model.Permissions{}); err != nil {
@@ -207,6 +258,149 @@ func TestAdminCannotShareApplicationDataDirectory(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "New share") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
+	}
+}
+
+func TestAdminFilesystemBrowserIsRestrictedAndSkipsSymlinks(t *testing.T) {
+	e := newTestEnv(t)
+	rootListingResponse := call(e.api.Handler(), "GET", "/api/admin/fs", e.adminToken, "", nil)
+	var rootListing model.DirectoryBrowser
+	if rootListingResponse.Code != http.StatusOK || json.Unmarshal(rootListingResponse.Body.Bytes(), &rootListing) != nil || rootListing.Path != string(os.PathSeparator) {
+		t.Fatalf("filesystem browser did not start at root: status=%d body=%s", rootListingResponse.Code, rootListingResponse.Body.String())
+	}
+	child := filepath.Join(e.root.Path, "child")
+	if err := os.Mkdir(child, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.root.Path, "secret-name.txt"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(e.root.Path, "linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	target := "/api/admin/fs?path=" + url.QueryEscape(e.root.Path)
+	handler := e.api.Handler()
+	response := call(handler, "GET", target, e.adminToken, "", nil)
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "secret-name.txt") || strings.Contains(response.Body.String(), "linked") {
+		t.Fatalf("admin directory listing status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "child") {
+		t.Fatalf("directory child missing: %s", response.Body.String())
+	}
+	response = call(handler, "GET", target, e.userToken, "", nil)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("regular user filesystem browser status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = call(handler, "GET", "/api/admin/fs?path=%2F..%2Fetc", e.adminToken, "", nil)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("traversal browser status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminCanHardDeleteUserAndRemoveRootRegistration(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.api.Handler()
+	entry := model.TrashEntry{ID: "user-trash", RootID: e.root.ID, OriginalPath: "old.txt", Name: "old.txt", DeletedBy: e.user.ID, DeletedAt: time.Now().UTC()}
+	if err := e.db.CreateTrash(entry, "trash/user-trash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.SetTrashReady(entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	response := call(handler, "DELETE", "/api/admin/users/"+strconv.FormatInt(e.user.ID, 10), e.userToken, e.userCSRF, nil)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("regular user delete-user status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = call(handler, "DELETE", "/api/admin/users/"+strconv.FormatInt(e.admin.ID, 10), e.adminToken, e.adminCSRF, nil)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("admin account deletion status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = call(handler, "DELETE", "/api/admin/users/"+strconv.FormatInt(e.user.ID, 10), e.adminToken, e.adminCSRF, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("admin delete-user status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = call(handler, "GET", "/api/me", e.userToken, "", nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted user session status=%d", response.Code)
+	}
+	response = call(handler, "GET", "/api/trash", e.adminToken, "", nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "user-trash") {
+		t.Fatalf("admin trash after owner deletion status=%d body=%s", response.Code, response.Body.String())
+	}
+	rootURL := "/api/admin/roots/" + strconv.FormatInt(e.root.ID, 10)
+	response = call(handler, "DELETE", rootURL, e.adminToken, e.adminCSRF, nil)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete root with active trash status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := e.db.MarkPurged(entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	response = call(handler, "DELETE", rootURL, e.adminToken, e.adminCSRF, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete root registration status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(e.root.Path); err != nil {
+		t.Fatalf("root filesystem directory was removed: %v", err)
+	}
+}
+
+func TestRunGracefullyHandlesSIGTERM(t *testing.T) {
+	if os.Getenv("SFM_SIGNAL_TEST_WORKER") == "1" {
+		if err := Run(os.Getenv("SFM_SIGNAL_TEST_ADDR"), "", "", http.NotFoundHandler()); err != nil {
+			t.Errorf("Run after SIGTERM: %v", err)
+		}
+		return
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("sandbox blocks local TCP listeners: %v", err)
+		}
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunGracefullyHandlesSIGTERM$")
+	cmd.Env = append(os.Environ(), "SFM_SIGNAL_TEST_WORKER=1", "SFM_SIGNAL_TEST_ADDR="+addr)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	readyUntil := time.Now().Add(5 * time.Second)
+	for time.Now().Before(readyUntil) {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		if cmd.Process.Signal(syscall.Signal(0)) != nil {
+			_ = cmd.Wait()
+			t.Fatalf("server worker exited before listening: %s", output.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if time.Now().After(readyUntil) {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("server worker did not listen: %s", output.String())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server worker did not exit cleanly: %v; output=%s", err, output.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("server worker did not stop after SIGTERM: %s", output.String())
 	}
 }
 

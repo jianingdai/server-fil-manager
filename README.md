@@ -5,15 +5,17 @@
 ## 功能
 
 - 管理员通过网页创建、停用普通用户、重置密码并配置逐目录权限；网页不能提升管理员角色。
-- 管理员可以登记当前运行账号可访问的服务器目录。共享目录不能重叠，也不能包含应用数据目录。
+- 管理员可以通过目录选择器浏览服务器目录，也可以手动输入路径；共享目录不能重叠，也不能包含应用数据目录。
+- 管理员可以单独停用或硬删除普通用户；硬删除会撤销权限和会话、释放用户名，已有回收站内容仍由管理员处理。
+- 管理员可以停用或删除共享目录登记。删除登记不删除服务器原目录；有待恢复/清理的回收站内容时不能删除。
 - 普通用户只能访问已授权目录。浏览、下载、上传、新建目录、重命名、删除、复制、移动和搜索分别授权。
-- 文件操作支持上传、下载、目录浏览、新建目录、重命名、跨目录复制/移动、按文件名搜索和可恢复删除。
+- 文件操作支持带进度展示的上传/下载、目录浏览、新建目录、重命名、跨目录复制/移动、按文件名搜索和可恢复删除。
 - 删除文件放入回收站，首版不会自动清理；管理员可永久清理。数据文件保留在 SQLite 之外。
 - 普通文件 API 使用共享目录 ID 与目录内相对路径。路径穿越和符号链接访问会被拒绝；不支持复制、删除设备节点、FIFO 或套接字。
 
 ## 数据表初稿与权限规则
 
-数据库在应用数据目录中的 `manager.sqlite3`。首版包含以下表：
+数据库在应用数据目录中的 `manager.sqlite3`。当前数据库结构版本为 v2，包含以下表：
 
 | 表 | 保存内容 |
 | --- | --- |
@@ -21,7 +23,7 @@
 | `storage_roots` | 管理员登记的目录名称、规范绝对路径、启用状态和创建者 |
 | `user_root_permissions` | 普通用户到共享目录的授权关系，分别记录浏览、下载、上传、新建目录、重命名、删除、复制、移动和搜索权限 |
 | `sessions` | 用户、会话令牌哈希、CSRF 令牌和创建/过期时间 |
-| `trash_entries` | 原目录和相对路径、回收站内容位置、删除人/时间及恢复/清理状态 |
+| `trash_entries` | 原目录和相对路径、回收站内容位置、可空的删除人/时间及恢复/清理状态；账号删除后记录保留 |
 | `audit_logs` | 操作者、操作类型、目录、相对路径、时间和结果；不记录文件内容 |
 | `schema_migrations` | 已应用的数据库结构版本 |
 
@@ -58,14 +60,39 @@ sha256sum dist/server-file-manager
 mkdir -p "$HOME/bin" "$HOME/.local/share/server-file-manager"
 chmod 700 "$HOME/.local/share/server-file-manager"
 # 将已校验的二进制文件放入 "$HOME/bin/server-file-manager"
+# 将 scripts/start.sh 与 scripts/stop.sh 复制到 "$HOME/bin/sfm-start.sh" 和 "$HOME/bin/sfm-stop.sh"
 chmod 700 "$HOME/bin/server-file-manager"
+chmod 700 "$HOME/bin/sfm-start.sh" "$HOME/bin/sfm-stop.sh"
 "$HOME/bin/server-file-manager" init-admin --data-dir "$HOME/.local/share/server-file-manager"
+"$HOME/bin/sfm-start.sh"
+```
+
+`init-admin` 会交互式隐藏密码输入，不提供默认账号密码。密码至少 12 个字符，bcrypt 限制最多 72 个 UTF-8 字节。启动脚本使用 `nohup` 在后台运行，不需要 sudo，也不会配置重启后的自动启动。脚本默认读取 `$HOME/bin/server-file-manager`，数据库和运行数据放在 `$HOME/.local/share/server-file-manager`，监听 `:8080`。浏览器访问 `http://<服务器内网地址>:8080/`。服务器防火墙必须允许该高位端口；调整防火墙可能需要系统管理员协助。
+
+在服务器上停止服务：
+
+```sh
+"$HOME/bin/sfm-stop.sh"
+```
+
+服务 PID 和日志分别保存在数据目录中的 `server-file-manager.pid`、`server-file-manager.log`。启动和停止脚本校验 PID 对应的程序及启动参数，避免对其他进程发送信号。可通过以下变量覆盖默认值；启动和停止时要使用相同的设置：
+
+```sh
+SFM_BIN="$HOME/bin/server-file-manager" \
+SFM_DATA_DIR="$HOME/.local/share/server-file-manager" \
+SFM_LISTEN=":8080" "$HOME/bin/sfm-start.sh"
+SFM_BIN="$HOME/bin/server-file-manager" \
+SFM_DATA_DIR="$HOME/.local/share/server-file-manager" \
+SFM_LISTEN=":8080" "$HOME/bin/sfm-stop.sh"
+```
+
+也可以在前台直接运行二进制进行排障；收到 SIGTERM 或按 Ctrl-C 时服务会优雅关闭：
+
+```sh
 "$HOME/bin/server-file-manager" serve --listen :8080 --data-dir "$HOME/.local/share/server-file-manager"
 ```
 
-`init-admin` 会交互式隐藏密码输入，不提供默认账号密码。密码至少 12 个字符，bcrypt 限制最多 72 个 UTF-8 字节。服务前台运行，退出终端或按 Ctrl-C 会停止；首版不配置开机自启。浏览器访问 `http://<服务器内网地址>:8080/`。服务器防火墙必须允许该高位端口；调整防火墙可能需要系统管理员协助。
-
-登录后，管理员先在“共享目录”中输入显示名称和服务器上的绝对路径，再到“用户与权限”给普通用户分配权限。应用只能访问其 Linux 运行账号原本可访问的目录；请勿登记包含凭据、应用数据或不应共享内容的目录。共享路径必须是已存在目录，且不能和其他已登记目录重叠。
+登录后，管理员先在“共享目录”中输入显示名称，通过目录浏览器选择目录或手动填写服务器上的绝对路径，再确认规范路径。之后到“用户与权限”给普通用户分配权限。应用只能访问其 Linux 运行账号原本可访问的目录；请勿登记包含凭据、应用数据或不应共享内容的目录。共享路径必须是已存在目录，且不能和其他已登记目录重叠。
 
 可使用 `--max-upload-bytes N` 限制单个上传请求大小；默认 `0` 表示不设应用层大小上限。请结合磁盘容量和用户信任级别决定是否设置上限。搜索只匹配文件名，不读取文件内容。
 
